@@ -221,56 +221,86 @@ func (r *ModelClaimReconciler) wakeRequested(
 			continue
 		}
 
-		// One operation per request, so the runtime applies a request once
-		// however many passes see it.
-		operationID := fmt.Sprintf("controller-wake/%s/%s/%s", pod.UID, pm.UID, requestedAt)
-		if request, owned := policyWakeOnPod(pm, pod); owned {
-			operationID = request.OperationID
+		requestWoke, wakeErr := r.askWake(ctx, pm, inst, pod, i, requestedAt, ledgersOf, candidates, readings)
+		if wakeErr != nil {
+			return woke, wakeErr
 		}
-		var resp *RuntimeOperationResponse
-		resp, err = r.Runtime.Wake(ctx, pod.Status.PodIP, DefaultRuntimePort, &WakeRequest{
-			ModelName:   served,
-			OperationID: operationID,
-		})
-		readings.forget(pod.Name)
-		if err != nil && !refusedByRuntime(err) {
-			r.notePolicyWakeFailure(pm, inst, pod, err)
-			// Nothing is known to have failed. The request stays, and a later
-			// pass asks again, or sees the engine wake.
-			klog.InfoS("wake not answered; asking again on a later pass",
-				"pod", klog.KObj(pod), "model", pm.Name, "err", err)
-			continue
+		if requestWoke {
+			woke = true
 		}
-		if err != nil {
-			if canPlaceElsewhere(pm, candidates, ledgersOf) {
-				if err := r.markMoving(ctx, pm, i, pod, instanceReasonWakeFailed,
-					fmt.Sprintf("the runtime on pod %s could not wake it: %v", pod.Name, err)); err != nil {
-					return woke, err
-				}
-				continue
-			}
-			r.Recorder.Eventf(pm, corev1.EventTypeWarning, "WakeFailed",
-				"model %s could not be woken on pod %s, and no other pod can take it: %v", served, pod.Name, err)
-			if ensuresAwake(pm) {
-				inst.Reason = instanceReasonWakeFailed
-			}
-			r.takeBackWakeRequest(ctx, pod, key)
-			continue
-		}
-		if inst.Reason == instanceReasonWakeFailed {
-			inst.Reason = ""
-		}
-		// A pass that asks again before the engine is seen to wake gets the same
-		// operation back, which the runtime does not apply twice. Only the call
-		// that woke the engine says so: client-go drops an object's Events once
-		// it has raised 25 in a burst.
-		if resp == nil || resp.Applied {
-			r.Recorder.Eventf(pm, corev1.EventTypeNormal, "Waking",
-				"model %s is waking on pod %s, as asked at %s", served, pod.Name, requestedAt)
-		}
-		woke = true
 	}
 	return woke, nil
+}
+
+// askWake hands one request to the runtime and deals with its answer.
+//
+// The returned bool says whether this request woke the engine. An error ends
+// the pass. The request is left in place unless the wake is known to have
+// failed for good, so a later pass asks again with the same operation.
+func (r *ModelClaimReconciler) askWake(
+	ctx context.Context,
+	pm *modelv1alpha1.ModelClaim,
+	inst *modelv1alpha1.ModelClaimInstance,
+	pod *corev1.Pod,
+	index int,
+	requestedAt string,
+	ledgersOf func(pods []corev1.Pod) map[string]podLedger,
+	candidates []corev1.Pod,
+	readings *runtimeReadings,
+) (bool, error) {
+	key := constants.ModelClaimWakeAnnotationPrefix + pm.Name
+	served := servedModelName(pm)
+
+	// One operation per request, so the runtime applies a request once
+	// however many passes see it.
+	operationID := fmt.Sprintf("controller-wake/%s/%s/%s", pod.UID, pm.UID, requestedAt)
+	if request, owned := policyWakeOnPod(pm, pod); owned {
+		operationID = request.OperationID
+	}
+
+	var err error
+	var resp *RuntimeOperationResponse
+	resp, err = r.Runtime.Wake(ctx, pod.Status.PodIP, DefaultRuntimePort, &WakeRequest{
+		ModelName:   served,
+		OperationID: operationID,
+	})
+	readings.forget(pod.Name)
+	if err != nil && !refusedByRuntime(err) {
+		r.notePolicyWakeFailure(pm, inst, pod, err)
+		// Nothing is known to have failed. The request stays, and a later
+		// pass asks again, or sees the engine wake.
+		klog.InfoS("wake not answered; asking again on a later pass",
+			"pod", klog.KObj(pod), "model", pm.Name, "err", err)
+		return false, nil
+	}
+	if err != nil {
+		if canPlaceElsewhere(pm, candidates, ledgersOf) {
+			if err := r.markMoving(ctx, pm, index, pod, instanceReasonWakeFailed,
+				fmt.Sprintf("the runtime on pod %s could not wake it: %v", pod.Name, err)); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+		r.Recorder.Eventf(pm, corev1.EventTypeWarning, "WakeFailed",
+			"model %s could not be woken on pod %s, and no other pod can take it: %v", served, pod.Name, err)
+		if ensuresAwake(pm) {
+			inst.Reason = instanceReasonWakeFailed
+		}
+		r.takeBackWakeRequest(ctx, pod, key)
+		return false, nil
+	}
+	if inst.Reason == instanceReasonWakeFailed {
+		inst.Reason = ""
+	}
+	// A pass that asks again before the engine is seen to wake gets the same
+	// operation back, which the runtime does not apply twice. Only the call
+	// that woke the engine says so: client-go drops an object's Events once
+	// it has raised 25 in a burst.
+	if resp == nil || resp.Applied {
+		r.Recorder.Eventf(pm, corev1.EventTypeNormal, "Waking",
+			"model %s is waking on pod %s, as asked at %s", served, pod.Name, requestedAt)
+	}
+	return true, nil
 }
 
 // waitForRoom has a sleeping instance wait for room on its card. The wait is
