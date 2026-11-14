@@ -29,8 +29,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// modelCountCache is a minimal cache.Cache stub. binPack and leastAdapters only
-// read ListModelsByPod, so every other interface method stays nil.
+// modelCountCache is a minimal cache.Cache stub shared by the two
+// model-count schedulers (binPack and leastAdapters). They only read
+// ListModelsByPod, so every other interface method stays nil.
 type modelCountCache struct {
 	cache.Cache
 	models  map[string][]string
@@ -55,7 +56,7 @@ func readyPod(name string) v1.Pod {
 var errCacheMiss = errors.New("key does not exist in the cache")
 
 func TestBinPackSchedulerSelectPod(t *testing.T) {
-	t.Run("picks the pod with the most free capacity", func(t *testing.T) {
+	t.Run("a pod at capacity is passed over", func(t *testing.T) {
 		full := make([]string, 10)
 		c := modelCountCache{models: map[string][]string{
 			"p1": full,
@@ -66,10 +67,37 @@ func TestBinPackSchedulerSelectPod(t *testing.T) {
 		require.Equal(t, "p2", pod.Name)
 	})
 
+	// Two eligible pods of different fill pin binPack's documented objective:
+	// choose the pod with the least remaining space. With only one eligible pod
+	// (as in the case above) an inverted objective would go unnoticed.
+	t.Run("prefers the eligible pod with the least remaining capacity", func(t *testing.T) {
+		c := modelCountCache{models: map[string][]string{
+			"p1": adapters("a", "b", "c", "d", "e", "f", "g", "h"),
+			"p2": adapters("a", "b"),
+		}}
+		pod, err := NewBinPackScheduler(c).SelectPod(context.Background(), "m1", []v1.Pod{readyPod("p1"), readyPod("p2")})
+		require.NoError(t, err)
+		require.Equal(t, "p1", pod.Name)
+	})
+
 	// A pod deleted between candidate listing and selection must be passed over
 	// instead of failing the whole selection, mirroring leastThroughput (#3299)
-	// and leastLatency (#3405).
+	// and leastLatency (#3405). The surviving pod has zero models on purpose:
+	// dropping the `continue` would let the unscoreable pod win as a phantom
+	// zero-model candidate, so this subtest discriminates the skip on its own.
 	t.Run("a pod missing from the cache is passed over", func(t *testing.T) {
+		c := modelCountCache{
+			models:  map[string][]string{"p2": adapters()},
+			missing: map[string]bool{"p1": true},
+		}
+		pod, err := NewBinPackScheduler(c).SelectPod(context.Background(), "m1", []v1.Pod{readyPod("p1"), readyPod("p2")})
+		require.NoError(t, err)
+		require.Equal(t, "p2", pod.Name)
+	})
+
+	// lastErr must be dropped on success: an error from a skipped pod must not
+	// surface when another pod is selected.
+	t.Run("an unscoreable pod's error is dropped when another pod is selected", func(t *testing.T) {
 		c := modelCountCache{
 			models:  map[string][]string{"p2": adapters("a")},
 			missing: map[string]bool{"p1": true},
@@ -106,35 +134,6 @@ func TestBinPackSchedulerSelectPod(t *testing.T) {
 	t.Run("no ready pods to schedule on", func(t *testing.T) {
 		c := modelCountCache{models: map[string][]string{}}
 		_, err := NewBinPackScheduler(c).SelectPod(context.Background(), "m1", nil)
-		require.Error(t, err)
-		assert.Equal(t, "no ready pods to schedule on", err.Error())
-	})
-}
-
-func TestLeastAdaptersSelectPod(t *testing.T) {
-	t.Run("picks the pod with the fewest adapters", func(t *testing.T) {
-		c := modelCountCache{models: map[string][]string{
-			"p1": adapters("a", "b", "c"),
-			"p2": adapters("a"),
-		}}
-		pod, err := NewLeastAdapters(c).SelectPod(context.Background(), "m1", []v1.Pod{readyPod("p1"), readyPod("p2")})
-		require.NoError(t, err)
-		require.Equal(t, "p2", pod.Name)
-	})
-
-	t.Run("a pod missing from the cache is passed over", func(t *testing.T) {
-		c := modelCountCache{
-			models:  map[string][]string{"p2": adapters("a")},
-			missing: map[string]bool{"p1": true},
-		}
-		pod, err := NewLeastAdapters(c).SelectPod(context.Background(), "m1", []v1.Pod{readyPod("p1"), readyPod("p2")})
-		require.NoError(t, err)
-		require.Equal(t, "p2", pod.Name)
-	})
-
-	t.Run("no ready pods to schedule on", func(t *testing.T) {
-		c := modelCountCache{models: map[string][]string{}}
-		_, err := NewLeastAdapters(c).SelectPod(context.Background(), "m1", nil)
 		require.Error(t, err)
 		assert.Equal(t, "no ready pods to schedule on", err.Error())
 	})
